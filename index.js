@@ -18,6 +18,44 @@ if (!LEAD_TO) console.warn("WARN: LEAD_TO is not set — leads have nowhere to g
 
 const resend = new Resend(RESEND_API_KEY);
 const allowed = ALLOWED_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean);
+const allowedHosts = allowed.map((o) => { try { return new URL(o).host; } catch { return o; } });
+
+// --- Simple in-memory per-IP rate limiter ---
+const RL_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const RL_MAX = 5; // max lead submissions per IP per window
+const rlHits = new Map();
+function rateLimited(ip) {
+  const now = Date.now();
+  const arr = (rlHits.get(ip) || []).filter((t) => now - t < RL_WINDOW_MS);
+  arr.push(now);
+  rlHits.set(ip, arr);
+  if (rlHits.size > 5000) { for (const [k, v] of rlHits) if (!v.some((t) => now - t < RL_WINDOW_MS)) rlHits.delete(k); }
+  return arr.length > RL_MAX;
+}
+
+// --- Request must originate from our own site (browsers always send Origin cross-origin) ---
+function originOk(req) {
+  const o = req.headers.origin;
+  if (o) { try { return allowedHosts.includes(new URL(o).host); } catch { return false; } }
+  const ref = req.headers.referer;
+  if (ref) { try { return allowedHosts.includes(new URL(ref).host); } catch { return false; } }
+  return false; // no Origin and no Referer => not a real browser form submit
+}
+
+// --- Spam heuristics. Returns a reason string if the submission looks like spam, else null. ---
+const URL_RE = /(https?:\/\/|www\.|\[url|<a\s|href\s*=|\[link)/i;
+function spamReason(req, body) {
+  if (!originOk(req)) return "bad-origin";
+  if (String(body.company || "").trim()) return "honeypot"; // hidden field only bots fill
+  const elapsed = Number(body.elapsed);
+  if (Number.isFinite(elapsed) && elapsed < 3000) return "too-fast"; // submitted < 3s after load
+  const blob = [body.name, body.email, body.project, body.message].map((x) => String(x || "")).join(" \n ");
+  if (URL_RE.test(blob)) return "contains-link"; // links in a bathroom lead = spam
+  const digits = String(body.phone || "").replace(/\D/g, "");
+  if (digits.length < 7 || digits.length > 15) return "bad-phone";
+  if (String(body.name || "").length > 120 || String(body.message || "").length > 4000) return "too-long";
+  return null;
+}
 
 const app = express();
 app.set("trust proxy", true);
@@ -45,9 +83,23 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 // --- Lead form submissions (from the website) ---
 app.post("/api/lead", express.json(), async (req, res) => {
   try {
-    const { name, phone, email, project, message } = req.body || {};
+    const body = req.body || {};
+    const { name, phone, email, project, message } = body;
     if (!name || !phone) {
       return res.status(400).json({ ok: false, error: "Name and phone are required." });
+    }
+
+    const ip = (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.ip || "unknown";
+
+    // --- Anti-spam gate: reply with a fake success so bots don't learn to adapt. ---
+    const reason = spamReason(req, body);
+    if (reason) {
+      console.log(`Spam blocked [${reason}] ip=${ip} name=${JSON.stringify(name)} phone=${JSON.stringify(phone)}`);
+      return res.json({ ok: true });
+    }
+    if (rateLimited(ip)) {
+      console.log(`Spam blocked [rate-limit] ip=${ip}`);
+      return res.json({ ok: true });
     }
 
     const html = `
