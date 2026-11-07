@@ -42,6 +42,35 @@ function originOk(req) {
   return false; // no Origin and no Referer => not a real browser form submit
 }
 
+// --- Cloudflare Turnstile verification (strong bot gate). ---
+// Stays inactive until both TURNSTILE_SECRET and TURNSTILE_HOSTNAMES are set,
+// so deploying this code changes nothing until the widget is configured.
+const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET;
+const turnstileHosts = new Set(
+  (process.env.TURNSTILE_HOSTNAMES || "").split(",").map((s) => s.trim()).filter(Boolean)
+);
+async function verifyTurnstile(token, ip) {
+  if (!TURNSTILE_SECRET || turnstileHosts.size === 0) return { ok: true, skipped: true };
+  if (typeof token !== "string" || token.length === 0 || token.length > 2048) return { ok: false, reason: "missing-token" };
+  let result;
+  try {
+    const r = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      signal: AbortSignal.timeout(10000),
+      body: new URLSearchParams({ secret: TURNSTILE_SECRET, response: token, remoteip: ip || "" }),
+    });
+    if (!r.ok) throw new Error("siteverify " + r.status);
+    result = await r.json();
+  } catch (e) {
+    return { ok: false, reason: "siteverify-error" };
+  }
+  if (!result.success) return { ok: false, reason: "failed:" + ((result["error-codes"] || []).join(",") || "unknown") };
+  if (result.action && result.action !== "lead") return { ok: false, reason: "bad-action:" + result.action };
+  if (!turnstileHosts.has(result.hostname)) return { ok: false, reason: "bad-hostname:" + result.hostname };
+  return { ok: true };
+}
+
 // --- Spam heuristics. Returns a reason string if the submission looks like spam, else null. ---
 const URL_RE = /(https?:\/\/|www\.|\[url|<a\s|href\s*=|\[link)/i;
 function spamReason(req, body) {
@@ -99,6 +128,13 @@ app.post("/api/lead", express.json(), async (req, res) => {
     }
     if (rateLimited(ip)) {
       console.log(`Spam blocked [rate-limit] ip=${ip}`);
+      return res.json({ ok: true });
+    }
+
+    // --- Cloudflare Turnstile gate (strong proof-of-human). ---
+    const ts = await verifyTurnstile(body["cf-turnstile-response"], ip);
+    if (!ts.ok) {
+      console.log(`Turnstile blocked [${ts.reason}] ip=${ip} name=${JSON.stringify(name)}`);
       return res.json({ ok: true });
     }
 
